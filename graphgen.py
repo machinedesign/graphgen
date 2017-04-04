@@ -294,7 +294,7 @@ if __name__ == '__main__':
         emb_size=emb_size, 
         hidden_size=hidden_size,  
         n_edge_types=n_edge_types, 
-        max_length=max_edge_length, 
+        max_length=max_vertex_length, 
         repr_size=emb_size)
     if cuda: model = model.cuda()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
