@@ -6,28 +6,12 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 
-cuda = False
-
 import math
 from torch.optim import Optimizer
 
+from clize import run
 
-class GradNoise(Optimizer):
-
-    def __init__(self, params, sd=1):
-        defaults = dict(sd=1)
-        super(GradNoise, self).__init__(params, defaults)
-        self.sd = sd
-
-    def step(self, closure=None):
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                noise = torch.randn(p.data.size()) * self.sd
-                p.data.add_(noise)
-        return loss
-
+cuda = False
 
 class RNN(nn.Module):
     def __init__(self, input_size, emb_size, hidden_size, n_edge_types, max_length=10, repr_size=100, n_layers=1):
@@ -256,7 +240,21 @@ def save(vertices, edges, out='out.png'):
     else:
         raise ValueError()
 
-if __name__ == '__main__':
+def pad(corpus):
+    max_vertex_length = max(len(v) for v, e in corpus)
+    max_edge_length = max(len(e) for v, e in corpus)
+    corpus = [
+        ( _pad_seq(v, max_vertex_length, zero=0), 
+          _pad_seq(e, max_edge_length, zero=(0, 0, 0))
+        )
+        for v, e in corpus
+    ]
+    return corpus
+
+def _pad_seq(seq, max_length, zero=(0,)):
+    return seq + (max_length - len(seq)) * [zero]
+
+def main(*, padding=False):
     import pandas as pd
     """
     from rdkit import Chem
@@ -269,13 +267,11 @@ if __name__ == '__main__':
 
     df = pd.read_csv('chembl22.csv')
     corpus = df['smiles'].values
-    corpus = corpus[0:1]
-    #corpus = [
-    #    'C1=CC=CN=C1'
-    #]
+    corpus = corpus[0:1000]
     print(corpus[0])
-    corpus = map(preprocess, corpus)
-    corpus = list(corpus)
+    corpus = list(map(preprocess, corpus))
+    if padding:
+        corpus = pad(corpus)
     max_vertex_length = max(len(v) for v,e in corpus)
     max_edge_length = max(len(e) for v, e in corpus)
     crit = nn.CrossEntropyLoss()
@@ -285,7 +281,7 @@ if __name__ == '__main__':
     hidden_size = 128
     output_size = vocab_size
     n_layers = 1
-    batch_size = 1
+    batch_size = 128
     nb_epochs = 10000
     emb_size = 100
     n_edge_types = 22
@@ -404,3 +400,6 @@ if __name__ == '__main__':
         ]
         pd.DataFrame.from_dict(stats).to_csv('samples/stats.csv', index=False)
         print('loss : {:.3f}, acc_V : {:.3f}, acc_E_src : {:.3f}, acc_E_dst : {:.3f}, acc_E_type : {:.3f}, time : {:.3f}'.format(*fmt))
+
+if __name__ == '__main__':
+    run(main)
