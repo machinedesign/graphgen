@@ -11,7 +11,14 @@ from torch.optim import Optimizer
 
 from clize import run
 
-cuda = False
+cuda = True
+
+def layernorm(h):
+    mean = h.mean(1)
+    std = h.std(1)
+    mean = mean.repeat(1, h.size(1))
+    std  = std.repeat(1, h.size(1))
+    return (h - mean) / std
 
 class RNN(nn.Module):
     def __init__(self, input_size, emb_size, hidden_size, n_edge_types, max_length=10, repr_size=100, n_layers=1):
@@ -49,7 +56,7 @@ class RNN(nn.Module):
         E_dst = self.edge_encoder(input_edge[:, :, 1])
         E = torch.cat((E_src, E_dst), 2)
         E = E.transpose(0, 1)
-        h = model.edge_rnn(E[0], h)
+        h = self.edge_rnn(E[0], h)
         return h
 
     def forward(self, input_vertex, input_edge):
@@ -177,7 +184,7 @@ def generate(model, n_vertex_steps=10, n_edge_steps=10, out='out.png'):
 
 def preprocess(s):
     from rdkit import Chem
-    s = Chem.MolToSmiles(Chem.MolFromSmiles(s))
+    #s = Chem.MolToSmiles(Chem.MolFromSmiles(s))
     m = Chem.MolFromSmiles(s)
     Chem.Kekulize(m)
     vertices = []
@@ -191,6 +198,7 @@ def preprocess(s):
         if begin > end:
             begin, end = end, begin
         edges.append((begin, end, type))
+    #edges = sorted(edges)
     #special characters
     vertices = [0] + vertices + [0]
     edges = [(0, 0, 0)] + edges + [(0, 0, 0)]
@@ -254,6 +262,29 @@ def pad(corpus):
 def _pad_seq(seq, max_length, zero=(0,)):
     return seq + (max_length - len(seq)) * [zero]
 
+def randomize(s):
+    v, e = s
+    v = v[1:-1]
+    e = e[1:-1]
+    perm = defaultdict(int)
+    idx = np.arange(len(v))
+    np.random.shuffle(idx)
+    idx = idx.tolist()
+    for i, j in enumerate(idx):
+        perm[i] = j
+    v = [v[j] for j in idx]
+    e = [(perm[begin], perm[end], t) for begin, end, t in e]
+    v = [0] + v + [0]
+    e = [(0, 0, 0)] + e + [(0, 0, 0)]
+    return v, e
+
+def get_moving(moving, stats):
+    for k, v in stats.items():
+        prev = moving[k]
+        new_ = v[-1]
+        moving[k] = prev * 0.99 + new_ * 0.01
+    return moving
+
 def main(*, padding=False):
     import pandas as pd
     """
@@ -267,7 +298,10 @@ def main(*, padding=False):
 
     df = pd.read_csv('chembl22.csv')
     corpus = df['smiles'].values
-    corpus = corpus[0:1000]
+    corpus = corpus[0:100000]
+    #corpus = [
+    #    'COc1cc(c(c2c1OCO2)OC)CC=C'
+    #]
     print(corpus[0])
     corpus = list(map(preprocess, corpus))
     if padding:
@@ -278,10 +312,10 @@ def main(*, padding=False):
     if cuda: crit = crit.cuda()
     vocab_size = max(max(v) for v,e in corpus) + 1
     print('max vertices length : {}, max edges length : {}, vocab size : {}'.format(max_vertex_length, max_edge_length, vocab_size))
-    hidden_size = 128
+    hidden_size = 1024
     output_size = vocab_size
     n_layers = 1
-    batch_size = 128
+    batch_size = 1
     nb_epochs = 10000
     emb_size = 100
     n_edge_types = 22
@@ -293,8 +327,9 @@ def main(*, padding=False):
         max_length=max_vertex_length, 
         repr_size=emb_size)
     if cuda: model = model.cuda()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    #noise = GradNoise(model.parameters())
+    #optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    #optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
 
     v, e = corpus[0]
     save(v, e, out='true.png')
@@ -304,17 +339,21 @@ def main(*, padding=False):
     stats = defaultdict(list)
     with open('samples/generated', 'w'):
         pass
+    moving = defaultdict(float)
     for e in range(nb_epochs):
         print('Epoch {}...'.format(e))
         for i in range(0, len(corpus), batch_size):
+            model.zero_grad()
             t0 = time.time()
 
-            input_V = [v[0:-1] for v, _ in corpus[i:i + batch_size]]
-            target_V = [v[1:] for v, _ in corpus[i:i + batch_size]]
+            corpus_cur = corpus[i:i + batch_size]
+            #corpus_cur = list(map(randomize, corpus_cur))
+            input_V = [v[0:-1] for v, _ in corpus_cur]
+            target_V = [v[1:] for v, _ in corpus_cur]
 
-            input_E = [e[0:-1] for _, e in corpus[i:i + batch_size]]
-            target_E = [e[1:] for _, e in corpus[i:i + batch_size]]
-            
+            input_E = [e[0:-1] for _, e in corpus_cur]
+            target_E = [e[1:] for _, e in corpus_cur]
+
             input_V = Variable(torch.LongTensor(input_V))
             input_E =  Variable(torch.LongTensor(input_E))
 
@@ -328,7 +367,7 @@ def main(*, padding=False):
             target_E_dst = target_E_dst.view(-1)
             target_E_type = target_E[:, :, 2].contiguous()
             target_E_type = target_E_type.view(-1)
-            
+
             if cuda: input_V = input_V.cuda()
             if cuda: input_E = input_E.cuda()
             output_V, output_E, output_E_type = model(input_V, input_E)
@@ -346,7 +385,6 @@ def main(*, padding=False):
             output_E_dst = output_E_dst.view(output_E_dst.size(0) * output_E_dst.size(1), output_E_dst.size(2))
             output_E_type = output_E_type.transpose(1, 2).contiguous()
             output_E_type = output_E_type.view(output_E_type.size(0) * output_E_type.size(1), output_E_type.size(2))
-            
 
             if cuda: 
                 target_E_src = target_E_src.cuda()
@@ -355,17 +393,17 @@ def main(*, padding=False):
                 target_V = target_V.cuda()
 
             loss = (
-                crit(output_V, target_V) + 
-                crit(output_E_src, target_E_src) + 
-                crit(output_E_dst, target_E_dst) +
-                crit(output_E_type, target_E_type))
+                    crit(output_V, target_V) + 
+                    crit(output_E_src, target_E_src) + 
+                    crit(output_E_dst, target_E_dst) +
+                    crit(output_E_type, target_E_type))
             acc_V = acc(output_V, target_V)
             acc_E_src = acc(output_E_src, target_E_src)
             acc_E_dst = acc(output_E_dst, target_E_dst)
             acc_E_type = acc(output_E_type, target_E_type)
             loss.backward()
+            nn.utils.clip_grad_norm(model.parameters(), 2)
             optimizer.step()
-            #noise.step()
             dt = (time.time() - t0)
 
             stats['loss'].append(loss.data[0])
@@ -374,6 +412,7 @@ def main(*, padding=False):
             stats['acc_E_dst'].append(acc_E_dst.data[0])
             stats['acc_E_type'].append(acc_E_type.data[0])
             stats['dt'].append(dt)
+            moving = get_moving(moving, stats)
             if j % 10 == 0:
                 vert, edge = generate(
                     model, 
@@ -387,19 +426,20 @@ def main(*, padding=False):
                 else:
                     with open('samples/generated', 'a') as fd:
                         fd.write(s + '\n')
-                    k += 1
+                    k += 1 
+            if j % 100 == 0:
+                fmt = [
+                    moving['loss'],
+                    moving['acc_V'],
+                    moving['acc_E_src'],
+                    moving['acc_E_dst'],
+                    moving['acc_E_type'],
+                    moving['dt']
+                ]
+                pd.DataFrame.from_dict(stats).to_csv('samples/stats.csv', index=False)
+                torch.save(model, 'samples/model.th')
+                print('loss : {:.3f}, acc_V : {:.3f}, acc_E_src : {:.3f}, acc_E_dst : {:.3f}, acc_E_type : {:.3f}, time : {:.3f}'.format(*fmt))
             j += 1
-
-        fmt = [
-            np.mean(stats['loss']),
-            np.mean(stats['acc_V']),
-            np.mean(stats['acc_E_src']),
-            np.mean(stats['acc_E_dst']),
-            np.mean(stats['acc_E_type']),
-            np.mean(stats['dt'])
-        ]
-        pd.DataFrame.from_dict(stats).to_csv('samples/stats.csv', index=False)
-        print('loss : {:.3f}, acc_V : {:.3f}, acc_E_src : {:.3f}, acc_E_dst : {:.3f}, acc_E_type : {:.3f}, time : {:.3f}'.format(*fmt))
 
 if __name__ == '__main__':
     run(main)
