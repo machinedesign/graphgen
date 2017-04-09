@@ -1,7 +1,7 @@
 import numpy as np
 import time
 from collections import defaultdict
-
+import os
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
@@ -10,6 +10,15 @@ import math
 from torch.optim import Optimizer
 
 from clize import run
+
+"""
+from rdkit import Chem
+s = 'Cc1cc(ccc1C(=O)c2ccccc2Cl)N3N=CC(=O)NC3=O'
+a, b = s, deprocess(*preprocess(s))
+print(a, b)
+print(Chem.MolFromSmiles(a) == Chem.MolFromSmiles(b))
+"""
+
 
 cuda = True
 
@@ -184,7 +193,6 @@ def generate(model, n_vertex_steps=10, n_edge_steps=10, out='out.png'):
 
 def preprocess(s):
     from rdkit import Chem
-    #s = Chem.MolToSmiles(Chem.MolFromSmiles(s))
     m = Chem.MolFromSmiles(s)
     Chem.Kekulize(m)
     vertices = []
@@ -198,7 +206,6 @@ def preprocess(s):
         if begin > end:
             begin, end = end, begin
         edges.append((begin, end, type))
-    #edges = sorted(edges)
     #special characters
     vertices = [0] + vertices + [0]
     edges = [(0, 0, 0)] + edges + [(0, 0, 0)]
@@ -285,25 +292,19 @@ def get_moving(moving, stats):
         moving[k] = prev * 0.99 + new_ * 0.01
     return moving
 
-def main(*, padding=False):
-    import pandas as pd
-    """
-    from rdkit import Chem
-    s = 'Cc1cc(ccc1C(=O)c2ccccc2Cl)N3N=CC(=O)NC3=O'
-    a, b = s, deprocess(*preprocess(s))
-    print(a, b)
-    print(Chem.MolFromSmiles(a) == Chem.MolFromSmiles(b))
-    """
-    ###
 
+def main():
+    import pandas as pd
+    ###
+    if not os.path.exists('{{folder}}'):
+        os.mkdir('{{folder}}')
     df = pd.read_csv('chembl22.csv')
     corpus = df['smiles'].values
     corpus = corpus[0:100000]
-    #corpus = [
-    #    'COc1cc(c(c2c1OCO2)OC)CC=C'
-    #]
-    print(corpus[0])
     corpus = list(map(preprocess, corpus))
+    corpus = [(v, e) for v, e in corpus if len(v) < 100 and len(e) < 100]
+    print(len(corpus))
+    padding = False
     if padding:
         corpus = pad(corpus)
     max_vertex_length = max(len(v) for v,e in corpus)
@@ -312,12 +313,12 @@ def main(*, padding=False):
     if cuda: crit = crit.cuda()
     vocab_size = max(max(v) for v,e in corpus) + 1
     print('max vertices length : {}, max edges length : {}, vocab size : {}'.format(max_vertex_length, max_edge_length, vocab_size))
-    hidden_size = 1024
+    hidden_size = {{'hidden_size'|choice(32, 64, 96, 128, 192, 256, 512, 800)}}
     output_size = vocab_size
     n_layers = 1
     batch_size = 1
-    nb_epochs = 10000
-    emb_size = 100
+    nb_epochs = 100
+    emb_size = {{'emb_size'|choice(50, 100, 200, 300)}}
     n_edge_types = 22
     model = RNN(
         input_size=vocab_size, 
@@ -327,17 +328,24 @@ def main(*, padding=False):
         max_length=max_vertex_length, 
         repr_size=emb_size)
     if cuda: model = model.cuda()
-    #optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    #optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    algo = {{'algo'|choice(0, 1, 2)}}
+    lr = {{'lr'|loguniform(-5, -1)}}
+    if algo == 0:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    elif algo == 1:
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, nesterov=True, momentum=0.9)
+    elif algo == 2:
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
 
     v, e = corpus[0]
-    save(v, e, out='true.png')
+    save(v, e, out='{{folder}}/true.png')
     j = 0
     k = 0
+    gen_correct = 0.
     generated = []
     stats = defaultdict(list)
-    with open('samples/generated', 'w'):
+    with open('{{folder}}/generated', 'w'):
         pass
     moving = defaultdict(float)
     for e in range(nb_epochs):
@@ -418,15 +426,23 @@ def main(*, padding=False):
                     model, 
                     n_vertex_steps=max_vertex_length, 
                     n_edge_steps=max_edge_length)
-                out = 'samples/out_{:05d}.png'.format(k)
+                out = '{{folder}}/out_{:05d}.png'.format(k)
                 try:
                     s = save(vert, edge, out=out)
                 except Exception:
-                    pass
+                    gen_correct = gen_correct * 0.99 + 0 * 0.01
                 else:
-                    with open('samples/generated', 'a') as fd:
+                    with open('{{folder}}/generated', 'a') as fd:
                         fd.write(s + '\n')
-                    k += 1 
+                    gen_correct = gen_correct * 0.99 + 1 * 0.01
+                    k += 1
+            
+            if j % 10000 == 0:
+                for param_group in optimizer.param_groups:
+                    lr = param_group['lr']
+                    lr /= 2.
+                    param_group['lr'] = lr
+
             if j % 100 == 0:
                 fmt = [
                     moving['loss'],
@@ -434,12 +450,13 @@ def main(*, padding=False):
                     moving['acc_E_src'],
                     moving['acc_E_dst'],
                     moving['acc_E_type'],
-                    moving['dt']
+                    moving['dt'],
+                    gen_correct
                 ]
-                pd.DataFrame.from_dict(stats).to_csv('samples/stats.csv', index=False)
-                torch.save(model, 'samples/model.th')
-                print('loss : {:.3f}, acc_V : {:.3f}, acc_E_src : {:.3f}, acc_E_dst : {:.3f}, acc_E_type : {:.3f}, time : {:.3f}'.format(*fmt))
+                pd.DataFrame.from_dict(stats).to_csv('{{folder}}/stats.csv', index=False)
+                torch.save(model.state_dict(), '{{folder}}/model.th')
+                print('loss : {:.3f}, acc_V : {:.3f}, acc_E_src : {:.3f}, acc_E_dst : {:.3f}, acc_E_type : {:.3f}, time : {:.3f}, generated ratio: {:.3f}'.format(*fmt))
             j += 1
 
 if __name__ == '__main__':
-    run(main)
+    main()
